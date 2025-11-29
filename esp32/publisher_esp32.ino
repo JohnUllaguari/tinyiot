@@ -1,211 +1,231 @@
 /*
  publisher_esp32.ino
- Sketch Arduino para ESP32 que:
- - usa FreeRTOS tasks para simular lectura de sensores
- - agrupa lecturas en JSON y las envía al gateway por TCP
- - protocolo: HELLO PUBLISHER <id>\n  |  PUB <topic> <len>\n + 4-byte BE len + payload JSON
- - Adjust: GATEWAY_IP, GATEWAY_PORT, WIFI_SSID, WIFI_PASS
+ FreeRTOS-style ESP32 publisher for the tinyiot project.
+
+ - Two sensor tasks (simulated): temp_task and hum_task
+ - A sender task that collects latest sample and sends JSON to gateway
+ - Protocol:
+     HELLO PUBLISHER <id>\n
+     PUB <topic> <len>\n
+     [4-byte BE len] [payload bytes]
+ - Configure WIFI_SSID/WIFI_PASS and GATEWAY_HOST/GATEWAY_PORT below.
+ - To use with Wokwi + Codespaces, set GATEWAY_HOST to the ngrok host:port as explained below.
 */
 
 #include <Arduino.h>
 #include <WiFi.h>
-#include <sys/socket.h> // not used directly but useful to know
-#include <stdint.h>
+#include <sys/time.h>
 
-// ---------- CONFIG ----------
-#define WIFI_SSID     "YOUR_SSID"
-#define WIFI_PASS     "YOUR_PASSWORD"
 
-#define GATEWAY_IP    "192.168.1.100"   // <- Cambia a la IP del gateway (o hostname)
+#define WIFI_SSID "Wokwi-GUEST"
+#define WIFI_PASS ""
+
+// Gateway address: change before build/flash.
+// If using ngrok, put the host (e.g. "3.tcp.ngrok.io") and port (e.g. 12345)
+#define GATEWAY_HOST  "127.0.0.1"
 #define GATEWAY_PORT  6000
 
 #define PUBLISHER_ID  "esp32-01"
 #define TOPIC         "sensors/test/environment"
 
-#define QUEUE_LENGTH  8
-#define MAX_PAYLOAD   1024
+#define SAMPLE_QUEUE_LEN 8
+#define MAX_PAYLOAD 1024
 
-// ---------- FreeRTOS objects ----------
-static QueueHandle_t sensorQueue = NULL;
-
-// Structure to hold a measurement
+// Data structure shared between tasks
 typedef struct {
-  unsigned long ts;
+  unsigned long ts_ms;
   float temp;
   float hum;
-} sensor_sample_t;
+} sample_t;
 
-// ---------- Utility: build JSON payload ----------
-static void build_payload(char *buf, size_t buflen, const char *node_id, unsigned long ts, float temp, float hum) {
-  // Very small manual JSON build to avoid external libs
-  // Example:
-  // {"node":"esp32-01","ts":123456,"topic":"sensors/test/environment","data":{"temp":23,"hum":45}}
+static QueueHandle_t sampleQueue = NULL;
+
+// ---------- Helper: build JSON ----------
+static void build_payload(char *buf, size_t buflen, const char *node_id, unsigned long ts_ms, float temp, float hum) {
+  // compact JSON
   int n = snprintf(buf, buflen,
     "{\"node\":\"%s\",\"ts\":%lu,\"topic\":\"%s\",\"data\":{\"temp\":%.2f,\"hum\":%.2f}}",
-    node_id, ts, TOPIC, temp, hum);
-  if (n < 0 || n >= (int)buflen) {
-    // truncated — ensure null terminated
-    buf[buflen-1] = '\0';
-  }
+    node_id, ts_ms, TOPIC, temp, hum);
+  if (n < 0 || n >= (int)buflen) buf[buflen-1] = '\0';
 }
 
-// ---------- Networking helper: send_all using WiFiClient ----------
-static bool send_all(WiFiClient &c, const uint8_t *data, size_t len, unsigned long timeout_ms=5000) {
+// ---------- Networking helper: blocking send_all using WiFiClient ----------
+static bool send_all(WiFiClient &c, const uint8_t *data, size_t len, unsigned long timeout_ms=3000) {
   unsigned long start = millis();
   size_t sent = 0;
   while (sent < len) {
     size_t w = c.write(data + sent, len - sent);
-    if (w > 0) {
-      sent += w;
-      continue;
-    }
-    // if write returns 0, wait a bit but not indefinitely
+    if (w > 0) { sent += w; continue; }
     if (!c.connected()) return false;
     if (millis() - start > timeout_ms) return false;
-    delay(5);
+    delay(1);
   }
   return true;
 }
 
-// ---------- Tasks ----------
-
-// Simulated sensor reader: produce samples every 'interval_ms' and push to queue
-static void task_read_sensors(void *param) {
-  (void)param;
+// ---------- Task: simulate temperature sensor ----------
+static void temp_task(void *pv) {
+  (void)pv;
   TickType_t lastWake = xTaskGetTickCount();
-  const TickType_t interval = pdMS_TO_TICKS(1000); // every 1s produce simulated sample
+  const TickType_t interval = pdMS_TO_TICKS(700); // produce every 700ms
   while (1) {
-    sensor_sample_t s;
-    s.ts = (unsigned long)time(nullptr);
-    // simulate sensor values (simple noise)
-    s.temp = 20.0 + (random(0, 100) / 10.0); // 20.0 - 29.9
-    s.hum  = 30.0 + (random(0, 700) / 10.0); // 30.0 - 99.9
-    // push to queue (overwrite if full -> block short time then drop)
-    if (xQueueSend(sensorQueue, &s, pdMS_TO_TICKS(100)) != pdTRUE) {
-      // queue full, drop oldest: receive one and send again
-      sensor_sample_t tmp;
-      xQueueReceive(sensorQueue, &tmp, 0);
-      xQueueSend(sensorQueue, &s, 0);
+    // produce a sample and push to queue (update existing sample if queue full)
+    sample_t s;
+    s.ts_ms = (unsigned long)(esp_timer_get_time() / 1000ULL);
+    s.temp = 20.0f + (random(0, 100) / 10.0f); // 20.0 - 29.9
+    // only update temp field: to simplify we push full sample (hum will be last known)
+    // read latest hum if present (non-blocking)
+    sample_t prev;
+    if (xQueuePeek(sampleQueue, &prev, 0) == pdTRUE) {
+      s.hum = prev.hum;
+    } else {
+      s.hum = 50.0f; // default
+    }
+    // push (overwrite oldest if full)
+    if (xQueueSend(sampleQueue, &s, pdMS_TO_TICKS(50)) != pdTRUE) {
+      // queue full: remove one and push
+      sample_t tmp;
+      xQueueReceive(sampleQueue, &tmp, 0);
+      xQueueSend(sampleQueue, &s, 0);
     }
     vTaskDelayUntil(&lastWake, interval);
   }
 }
 
-// Sender task: connect to gateway and send queued samples
-static void task_sender(void *param) {
-  (void)param;
+// ---------- Task: simulate humidity sensor ----------
+static void hum_task(void *pv) {
+  (void)pv;
+  TickType_t lastWake = xTaskGetTickCount();
+  const TickType_t interval = pdMS_TO_TICKS(1100); // produce every 1100ms
+  while (1) {
+    sample_t s;
+    s.ts_ms = (unsigned long)(esp_timer_get_time() / 1000ULL);
+    s.hum = 30.0f + (random(0, 700) / 10.0f); // 30.0 - 99.9
+    if (xQueuePeek(sampleQueue, &s, 0) == pdTRUE) {
+      // update hum into existing sample structure
+    }
+    // Build a sample that includes last known temp (if any)
+    sample_t out;
+    if (xQueuePeek(sampleQueue, &out, 0) == pdTRUE) {
+      out.hum = s.hum;
+      out.ts_ms = (unsigned long)(esp_timer_get_time() / 1000ULL);
+      if (xQueueSend(sampleQueue, &out, pdMS_TO_TICKS(50)) != pdTRUE) {
+        sample_t tmp; xQueueReceive(sampleQueue, &tmp, 0); xQueueSend(sampleQueue, &out, 0);
+      }
+    } else {
+      // No prior temp, push fresh
+      sample_t o;
+      o.temp = 22.0f + (random(0,50)/10.0f);
+      o.hum = s.hum;
+      o.ts_ms = (unsigned long)(esp_timer_get_time() / 1000ULL);
+      if (xQueueSend(sampleQueue, &o, pdMS_TO_TICKS(50)) != pdTRUE) {
+        sample_t tmp; xQueueReceive(sampleQueue, &tmp, 0); xQueueSend(sampleQueue, &o, 0);
+      }
+    }
+    vTaskDelayUntil(&lastWake, interval);
+  }
+}
+
+// ---------- Task: sender ----------------
+static void sender_task(void *pv) {
+  (void)pv;
   WiFiClient client;
   char payload[MAX_PAYLOAD];
   char header[128];
-
-  for (;;) {
+  while (1) {
     // ensure WiFi connected
-    if (WiFi.status() != WL_CONNECTED) {
-      // block until connected
-      Serial.println("[SENDER] waiting for WiFi...");
-      vTaskDelay(pdMS_TO_TICKS(1000));
-      continue;
-    }
-    // try connect to gateway
-    Serial.printf("[SENDER] connecting to gateway %s:%d ...\n", GATEWAY_IP, GATEWAY_PORT);
-    if (!client.connect(GATEWAY_IP, GATEWAY_PORT, 5000)) {
+    if (WiFi.status() != WL_CONNECTED) { vTaskDelay(pdMS_TO_TICKS(1000)); continue; }
+
+    Serial.printf("[SENDER] connecting to gateway %s:%d ...\n", GATEWAY_HOST, GATEWAY_PORT);
+    if (!client.connect(GATEWAY_HOST, GATEWAY_PORT, 5000)) {
       Serial.println("[SENDER] connect failed, retry in 2s");
       client.stop();
       vTaskDelay(pdMS_TO_TICKS(2000));
       continue;
     }
-    Serial.println("[SENDER] connected to gateway");
-    // send HELLO
-    String hello = String("HELLO PUBLISHER ") + PUBLISHER_ID + "\n";
-    client.print(hello);
-    // wait for OK (simple blocking read with timeout)
-    unsigned long tstart = millis();
+    Serial.println("[SENDER] connected, sending HELLO");
+    client.print(String("HELLO PUBLISHER ") + PUBLISHER_ID + "\n");
+
+    // wait for OK (short)
+    unsigned long t0 = millis();
     String resp = "";
-    while (millis() - tstart < 5000) {
+    while (millis() - t0 < 3000) {
       while (client.available()) {
         char ch = client.read();
-        if (ch == '\n') goto got_hello_resp;
+        if (ch == '\n') goto got_ok;
         resp += ch;
       }
       delay(1);
     }
-got_hello_resp:
+got_ok:
     resp.trim();
     Serial.printf("[SENDER] gateway replied: '%s'\n", resp.c_str());
     if (resp != "OK") {
-      Serial.println("[SENDER] gateway did not reply OK, closing and retrying");
       client.stop();
       vTaskDelay(pdMS_TO_TICKS(2000));
       continue;
     }
 
-    // Now enter sending loop: pop samples from queue and send
-    sensor_sample_t sample;
+    // Sending loop: poll queue for latest sample (flush duplicates by reading many)
+    sample_t sample;
     while (client.connected()) {
-      // block until sample available
-      if (xQueueReceive(sensorQueue, &sample, pdMS_TO_TICKS(5000)) == pdTRUE) {
-        // build payload
-        build_payload(payload, sizeof(payload), PUBLISHER_ID, sample.ts, sample.temp, sample.hum);
+      // wait for a sample up to 3s
+      if (xQueueReceive(sampleQueue, &sample, pdMS_TO_TICKS(3000)) == pdTRUE) {
+        // Build JSON payload with ts in ms
+        unsigned long now_ms = (unsigned long)(esp_timer_get_time() / 1000ULL);
+        build_payload(payload, sizeof(payload), PUBLISHER_ID, now_ms, sample.temp, sample.hum);
         size_t len = strlen(payload);
-        // header: PUB <topic> <len>\n
         int hn = snprintf(header, sizeof(header), "PUB %s %u\n", TOPIC, (unsigned)len);
         if (hn < 0) { Serial.println("[SENDER] header snprintf error"); continue; }
-        // send header text
+        // send header
         if (!send_all(client, (const uint8_t*)header, hn)) { Serial.println("[SENDER] header send failed"); break; }
-        // send 4-byte BE len
+        // send 4-byte BE length
         uint32_t be = htonl((uint32_t)len);
         if (!send_all(client, (const uint8_t*)&be, sizeof(be))) { Serial.println("[SENDER] len send failed"); break; }
-        // send payload text
+        // payload
         if (!send_all(client, (const uint8_t*)payload, len)) { Serial.println("[SENDER] payload send failed"); break; }
         Serial.printf("[SENDER] sent payload len=%u\n", (unsigned)len);
-        // wait for OK line from gateway
+        // read optional OK (short)
+        unsigned long tq = millis();
         String okr = "";
-        unsigned long t0 = millis();
         bool got_ok = false;
-        while (millis() - t0 < 3000) {
+        while (millis() - tq < 1000) {
           while (client.available()) {
             char ch = client.read();
-            if (ch == '\n') {
-              okr.trim();
-              if (okr == "OK") got_ok = true;
-              break;
-            }
+            if (ch == '\n') { okr.trim(); if (okr == "OK") got_ok = true; break; }
             okr += ch;
           }
           if (got_ok) break;
           delay(1);
         }
         if (!got_ok) {
-          Serial.println("[SENDER] did not receive OK, continuing (but message already forwarded)");
-          // continue; // we keep going; re-send policy can be added
+          // not fatal
         }
       } else {
-        // timeout waiting for measurement -> check connectivity, loop
+        // no sample in 3s -> check connectivity & continue
       }
-    } // end while connected
-    Serial.println("[SENDER] disconnected from gateway, will retry");
+    } // while connected
+    Serial.println("[SENDER] disconnected from gateway, retry in 2s");
     client.stop();
     vTaskDelay(pdMS_TO_TICKS(2000));
-  } // end forever
+  } // forever
 }
 
-// ---------- setup/loop ----------
+// ---------- setup ----------
 void setup() {
   Serial.begin(115200);
-  delay(1000);
-  Serial.println("ESP32 publisher starting...");
+  delay(500);
+  Serial.println("ESP32 publisher (FreeRTOS) starting...");
 
-  // init random seed
   randomSeed((unsigned)esp_random());
 
-  // create queue
-  sensorQueue = xQueueCreate(QUEUE_LENGTH, sizeof(sensor_sample_t));
-  if (!sensorQueue) {
-    Serial.println("Failed to create queue");
+  sampleQueue = xQueueCreate(SAMPLE_QUEUE_LEN, sizeof(sample_t));
+  if (!sampleQueue) {
+    Serial.println("Queue create failed");
     while (1) delay(1000);
   }
 
-  // connect to WiFi
+  // Connect WiFi
   WiFi.begin(WIFI_SSID, WIFI_PASS);
   Serial.printf("Connecting to WiFi '%s' ...\n", WIFI_SSID);
   unsigned long start = millis();
@@ -220,12 +240,12 @@ void setup() {
   Serial.println();
   Serial.print("WiFi connected, IP: "); Serial.println(WiFi.localIP());
 
-  // create FreeRTOS tasks
-  xTaskCreatePinnedToCore(task_read_sensors, "read_sensors", 4096, NULL, 1, NULL, 1);
-  xTaskCreatePinnedToCore(task_sender, "sender", 8192, NULL, 2, NULL, 1);
+  // Create tasks. Pin tasks to a core (optional)
+  xTaskCreatePinnedToCore(temp_task, "temp", 4096, NULL, 1, NULL, 1);
+  xTaskCreatePinnedToCore(hum_task, "hum", 4096, NULL, 1, NULL, 1);
+  xTaskCreatePinnedToCore(sender_task, "sender", 8192, NULL, 2, NULL, 1);
 }
 
 void loop() {
-  // Nothing here; tasks run independently
   delay(1000);
 }

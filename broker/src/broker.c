@@ -1,3 +1,4 @@
+/* broker/src/broker.c  -- versión con buffers de salida y EPOLLOUT handling */
 #define _GNU_SOURCE
 #include "proto.h"
 #include <stdio.h>
@@ -12,7 +13,7 @@
 #include <arpa/inet.h>
 #include <assert.h>
 
-/* Refer to epoll_fd defined in main.c */
+/* epoll_fd definido en main.c */
 extern int epoll_fd;
 
 /* Roles */
@@ -37,6 +38,11 @@ struct conn {
     char *payload_buf;           /* allocated expected_len+1 */
     uint32_t payload_received;   /* bytes received so far into payload_buf */
     char current_topic[256];
+
+    /* OUTPUT buffer: queue pending data to send to this conn */
+    char *outbuf;                /* allocated buffer */
+    size_t outbuf_len;           /* total bytes in outbuf */
+    size_t outbuf_sent;          /* bytes already sent */
 };
 
 /* fd_map global (visible to main.c as extern) */
@@ -60,6 +66,9 @@ struct conn *conn_create(int fd) {
     c->payload_buf = NULL;
     c->payload_received = 0;
     c->current_topic[0] = '\0';
+    c->outbuf = NULL;
+    c->outbuf_len = 0;
+    c->outbuf_sent = 0;
     if (fd >= 0 && fd < MAX_FD_LIMIT) fd_map[fd] = c;
     return c;
 }
@@ -67,12 +76,103 @@ struct conn *conn_create(int fd) {
 void conn_destroy(struct conn *c) {
     if (!c) return;
     if (c->payload_buf) free(c->payload_buf);
+    if (c->outbuf) free(c->outbuf);
     int fd = c->fd;
     if (fd >= 0 && fd < MAX_FD_LIMIT) fd_map[fd] = NULL;
     free(c);
 }
 
-/* topic management */
+/* epoll modify helper: set/unset EPOLLOUT on a given fd based on want_out */
+static int epoll_modify_events(int fd, int want_out) {
+    struct epoll_event ev;
+    ev.data.fd = fd;
+    ev.events = EPOLLIN;
+    if (want_out) ev.events |= EPOLLOUT;
+    if (epoll_ctl(epoll_fd, EPOLL_CTL_MOD, fd, &ev) == -1) {
+        if (errno == ENOENT) {
+            /* maybe fd not previously registered: add it */
+            if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, fd, &ev) == -1) {
+                perror("epoll_ctl ADD in epoll_modify_events");
+                return -1;
+            }
+            return 0;
+        }
+        perror("epoll_ctl MOD in epoll_modify_events");
+        return -1;
+    }
+    return 0;
+}
+
+/* Queue data to connection's outbuf. Returns 0 success, -1 error (close connection) */
+static int conn_queue_out(struct conn *c, const char *data, size_t len) {
+    if (!c || len == 0) return 0;
+    size_t need = c->outbuf_len - c->outbuf_sent + len;
+    /* We store only the remaining bytes (not the already-sent prefix) */
+    size_t remaining = c->outbuf_len - c->outbuf_sent;
+    char *newbuf = malloc(remaining + len);
+    if (!newbuf) return -1;
+    /* copy remaining unsent data */
+    if (remaining > 0) memcpy(newbuf, c->outbuf + c->outbuf_sent, remaining);
+    /* append new data */
+    memcpy(newbuf + remaining, data, len);
+    /* free old buffer and replace */
+    if (c->outbuf) free(c->outbuf);
+    c->outbuf = newbuf;
+    c->outbuf_len = remaining + len;
+    c->outbuf_sent = 0;
+    /* ensure EPOLLOUT is enabled for this fd */
+    if (epoll_modify_events(c->fd, 1) < 0) {
+        return -1;
+    }
+    return 0;
+}
+
+/* Try to flush outbuf to socket. Returns:
+ *   0 -> flushed fully (no pending)
+ *   1 -> still pending (would block)
+ *  -1 -> fatal error (close)
+ */
+int flush_outbuf(int fd) {
+    if (fd < 0 || fd >= MAX_FD_LIMIT) return -1;
+    struct conn *c = fd_map[fd];
+    if (!c) return -1;
+    if (!c->outbuf || c->outbuf_sent >= c->outbuf_len) {
+        /* nothing to send: ensure EPOLLOUT cleared */
+        c->outbuf_len = 0;
+        c->outbuf_sent = 0;
+        if (c->outbuf) { free(c->outbuf); c->outbuf = NULL; }
+        epoll_modify_events(fd, 0);
+        return 0;
+    }
+    size_t to_send = c->outbuf_len - c->outbuf_sent;
+    ssize_t w = write(fd, c->outbuf + c->outbuf_sent, to_send);
+    if (w < 0) {
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            /* socket not ready now */
+            epoll_modify_events(fd, 1);
+            return 1;
+        }
+        if (errno == EINTR) return 1;
+        perror("write in flush_outbuf");
+        return -1;
+    }
+    c->outbuf_sent += (size_t)w;
+    if (c->outbuf_sent >= c->outbuf_len) {
+        /* all sent */
+        free(c->outbuf);
+        c->outbuf = NULL;
+        c->outbuf_len = 0;
+        c->outbuf_sent = 0;
+        /* remove EPOLLOUT interest */
+        epoll_modify_events(fd, 0);
+        return 0;
+    }
+    /* still pending */
+    epoll_modify_events(fd, 1);
+    return 1;
+}
+
+/* topic management (same as before) */
 static struct topic_entry *find_topic(const char *topic) {
     for (struct topic_entry *t = topics; t; t = t->next)
         if (strcmp(t->topic, topic) == 0) return t;
@@ -131,7 +231,7 @@ static void cleanup_empty_topics(void) {
     }
 }
 
-/* Publish: send payload to each subscriber (drop subscriber if send would block or error) */
+/* Publish: enqueue 4-byte BE len + payload to each subscriber */
 static void publish_to_topic(const char *topic, const char *payload, uint32_t len) {
     struct topic_entry *t = find_topic(topic);
     if (!t) {
@@ -142,18 +242,27 @@ static void publish_to_topic(const char *topic, const char *payload, uint32_t le
     struct sub_node **pp = &t->subs;
     while (*pp) {
         int fd = (*pp)->fd;
-        if (fd < 0 || fd >= MAX_FD_LIMIT) { struct sub_node *rem = *pp; *pp = rem->next; free(rem); continue; }
-        int r = send_payload_nb(fd, payload, len);
-        if (r == 0) {
-            delivered++;
-            pp = &(*pp)->next;
-        } else {
-            /* remove subscriber on error or would-block for this prototype */
-            fprintf(stderr, "[WARN] removing subscriber fd=%d (send r=%d)\n", fd, r);
-            struct sub_node *rem = *pp;
-            *pp = rem->next;
-            free(rem);
+        if (fd < 0 || fd >= MAX_FD_LIMIT) {
+            struct sub_node *rem = *pp; *pp = rem->next; free(rem); continue;
         }
+        struct conn *c = fd_map[fd];
+        if (!c) { struct sub_node *rem = *pp; *pp = rem->next; free(rem); continue; }
+        /* prepare buffer 4-byte BE len + payload */
+        size_t tot = sizeof(uint32_t) + len;
+        char *buf = malloc(tot);
+        if (!buf) { fprintf(stderr, "[WARN] OOM when publishing\n"); break; }
+        uint32_t be = htonl(len);
+        memcpy(buf, &be, sizeof(uint32_t));
+        memcpy(buf + sizeof(uint32_t), payload, len);
+        if (conn_queue_out(c, buf, tot) < 0) {
+            fprintf(stderr, "[WARN] removing subscriber fd=%d (queue failed)\n", fd);
+            free(buf);
+            struct sub_node *rem = *pp; *pp = rem->next; free(rem);
+            continue;
+        }
+        free(buf);
+        delivered++;
+        pp = &(*pp)->next;
     }
     fprintf(stderr, "[INFO] published topic=%s -> %d subscribers\n", topic, delivered);
 }
@@ -208,13 +317,10 @@ static int handle_command_line(struct conn *c, const char *line) {
         if (!topic || !lenstr) { dprintf(c->fd, "ERR PROTO\n"); return -1; }
         long len = strtol(lenstr, NULL, 10);
         if (len <= 0 || len > TINY_MAX_PAYLOAD) { dprintf(c->fd, "ERR OVERFLOW\n"); return -1; }
-        /* prepare to read 4-byte prefix + payload: in our design, after PUB header, client sends 4-byte BE len then payload bytes.
-         * We'll set state to AWAIT_LEN and allocate buffer of expected length.
-         */
         c->state = S_AWAIT_LEN;
         c->expected_len = (uint32_t)len;
         if (c->payload_buf) { free(c->payload_buf); c->payload_buf = NULL; }
-        c->payload_buf = malloc(c->expected_len + 1 + sizeof(uint32_t)); /* allocate extra to read header temporarily */
+        c->payload_buf = malloc(c->expected_len + 1 + sizeof(uint32_t));
         if (!c->payload_buf) { dprintf(c->fd, "ERR INTERNAL\n"); return -1; }
         c->payload_received = 0;
         strncpy(c->current_topic, topic, sizeof(c->current_topic)-1);
@@ -238,9 +344,8 @@ static int process_conn_incoming(struct conn *c) {
     size_t pos = 0;
     while (pos < c->inbuf_len) {
         if (c->state == S_AWAIT_LINE) {
-            /* look for newline */
             char *nl = memchr(c->inbuf + pos, '\n', c->inbuf_len - pos);
-            if (!nl) break; /* wait more */
+            if (!nl) break;
             size_t linelen = (size_t)(nl - (c->inbuf + pos));
             if (linelen >= TINY_MAX_LINE) { fprintf(stderr, "[ERROR] line too long\n"); return -1; }
             char line[TINY_MAX_LINE];
@@ -252,22 +357,19 @@ static int process_conn_incoming(struct conn *c) {
             if (h < 0) return -1;
             continue;
         } else if (c->state == S_AWAIT_LEN) {
-            /* need 4 bytes BE len prefix */
             size_t need = sizeof(uint32_t) - c->payload_received;
             size_t avail = c->inbuf_len - pos;
             size_t to_copy = (avail < need) ? avail : need;
             memcpy(c->payload_buf + c->payload_received, c->inbuf + pos, to_copy);
             c->payload_received += to_copy;
             pos += to_copy;
-            if (c->payload_received < sizeof(uint32_t)) break; /* wait more */
-            uint32_t be = 0;
-            memcpy(&be, c->payload_buf, sizeof(uint32_t));
+            if (c->payload_received < sizeof(uint32_t)) break;
+            uint32_t be = 0; memcpy(&be, c->payload_buf, sizeof(uint32_t));
             uint32_t declared = ntohl(be);
             if (declared != c->expected_len) {
                 fprintf(stderr, "[ERROR] declared len %u != expected %u\n", declared, c->expected_len);
                 return -1;
             }
-            /* switch to payload; reset received to 0 */
             c->payload_received = 0;
             c->state = S_AWAIT_PAYLOAD;
             continue;
@@ -278,8 +380,7 @@ static int process_conn_incoming(struct conn *c) {
             memcpy(c->payload_buf + c->payload_received, c->inbuf + pos, to_copy);
             c->payload_received += to_copy;
             pos += to_copy;
-            if (c->payload_received < c->expected_len) break; /* wait more */
-            /* full payload acquired */
+            if (c->payload_received < c->expected_len) break;
             c->payload_buf[c->expected_len] = '\0';
             publish_to_topic(c->current_topic, c->payload_buf, c->expected_len);
             free(c->payload_buf);
@@ -294,7 +395,6 @@ static int process_conn_incoming(struct conn *c) {
             return -1;
         }
     }
-    /* shift remaining bytes to front */
     if (pos > 0) {
         if (pos < c->inbuf_len) memmove(c->inbuf, c->inbuf + pos, c->inbuf_len - pos);
         c->inbuf_len -= pos;
@@ -382,32 +482,18 @@ int process_fd_event(int fd) {
     }
     int r = read_into_conn(c);
     if (r == -2) {
-        /* Peer closed the connection (EOF). But there may be bytes already
-         * accumulated in c->inbuf that we must process before closing.
-         * Try to process them now.
-         */
+        /* Peer closed. Process any buffered data before closing */
         if (c->inbuf_len > 0) {
             int p = process_conn_incoming(c);
-            if (p == -2) {
-                /* process indicated close requested (BYE) or EOF after processing */
-                return -2;
-            } else if (p < 0) {
-                /* error during processing */
-                return -1;
-            }
-            /* processed buffered data successfully; proceed to close connection
-             * because peer indicated EOF. Return -2 to signal caller to cleanup.
-             */
-            return -2;
+            if (p == -2) return -2;
+            if (p < 0) return -1;
+            return -2; /* peer closed after processing */
         } else {
-            /* no buffered data — safe to close */
             return -2;
         }
     } else if (r < 0) {
         return -1;
     }
-    /* Now process what's in inbuf */
     int p = process_conn_incoming(c);
     return p;
 }
-

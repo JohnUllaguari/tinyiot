@@ -19,6 +19,8 @@ extern struct conn *fd_map[];
 int accept_new(int listen_fd);
 int process_fd_event(int fd);
 void close_connection(int fd);
+/* new: flush_outbuf called when EPOLLOUT */
+int flush_outbuf(int fd);
 
 /* global epoll fd used by broker.c */
 int epoll_fd = -1;
@@ -72,7 +74,6 @@ int main(int argc, char **argv) {
         for (int i = 0; i < n; ++i) {
             int fd = events[i].data.fd;
             uint32_t evts = events[i].events;
-            /* debug print to help trace */
             fprintf(stderr, "[DBG] epoll event fd=%d ev=0x%x\n", fd, evts);
             if (fd == listen_fd) {
                 accept_new(listen_fd);
@@ -92,7 +93,10 @@ int main(int argc, char **argv) {
                 }
             }
             if (evts & EPOLLOUT) {
-                /* Not used in this skeleton: we don't maintain output buffers yet */
+                int r = flush_outbuf(fd);
+                if (r < 0) {
+                    close_connection(fd);
+                }
             }
         }
     }

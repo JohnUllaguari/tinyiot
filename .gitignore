@@ -1,0 +1,35 @@
+# Build artifacts
+**/*.o
+**/*.obj
+**/*.elf
+**/*.bin
+brokerd
+gatewayd
+publisher_sim
+
+# Python
+__pycache__/
+*.py[cod]
+.env
+.env.local
+
+# Node
+node_modules/
+
+# Logs & temp
+*.log
+*.tmp
+*.swp
+*~
+.DS_Store
+
+# IDEs
+.vscode/
+.idea/
+
+# Archives
+archive_*/
+
+# Mac/Windows
+Thumbs.db
+./latencies.csv

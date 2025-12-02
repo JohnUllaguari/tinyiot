@@ -191,7 +191,15 @@ cd tests/scripts/
 python3 send_pub.py
 ```
 
-**Opción C: ESP32 real** (flasheado previamente)
+**Opción C: N ppublishers**
+```bash
+#Correr previamente un subscriber
+$ python3 tests/scripts/sub_client.py
+#loadtest
+$ python3 loadtest/loadtest.py -n 10 -m 50 -i 0.5
+```
+
+**Opción D: ESP32 real** (flasheado previamente)
 ```
 El ESP32 se conectará automáticamente y comenzará a enviar datos
 ```

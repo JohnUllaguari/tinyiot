@@ -191,17 +191,11 @@ cd tests/scripts/
 python3 send_pub.py
 ```
 
-**Opción C: N ppublishers**
+**Opción C: ESP32 real**
 ```bash
-#Correr previamente un subscriber
-$ python3 tests/scripts/sub_client.py
-#loadtest
-$ python3 loadtest/loadtest.py -n 10 -m 50 -i 0.5
-```
+#El ESP32 se conectará automáticamente y comenzará a enviar datos
+$ ngrok tcp 6000
 
-**Opción D: ESP32 real** (flasheado previamente)
-```
-El ESP32 se conectará automáticamente y comenzará a enviar datos
 ```
 
 ## 🔌 Protocolo de Comunicación
@@ -257,10 +251,11 @@ PUB sensors/test/environment 98\n
 ## 🧪 Pruebas de Carga
 
 ### Ejecutar Load Test
-
 ```bash
-cd loadtest/
-python3 loadtest.py -n 50 -m 100 -i 0.1 --host 127.0.0.1 --port 6000
+#Correr previamente un subscriber
+$ python3 tests/scripts/sub_client.py
+#loadtest
+$ python3 loadtest/loadtest.py -n 10 -m 50 -i 0.5
 ```
 
 **Parámetros:**
@@ -284,17 +279,17 @@ Duration: 52.34s, throughput (msg/s): 95.53
 **Terminal 1 - Subscriber con medición:**
 ```bash
 cd loadtest/
-python3 sub_client_latency.py
+$ python3 sub_client_latency.py
 ```
 
 **Terminal 2 - Generar carga:**
 ```bash
-python3 loadtest.py -n 10 -m 50 -i 0.05
+$ python3 loadtest/loadtest.py -n 10 -m 50 -i 0.5
 ```
 
 **Terminal 3 - Analizar resultados:**
 ```bash
-python3 analyze_latencies.py
+$ python3 analyze_latencies.py
 ```
 
 **Salida esperada:**
